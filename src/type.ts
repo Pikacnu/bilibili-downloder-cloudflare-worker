@@ -635,3 +635,8 @@ export enum BilibiliVideoIdType {
 	episode,
 	unknown,
 }
+
+export type VideoLinkData = {
+	links: string[];
+	createdAt: number;
+};
