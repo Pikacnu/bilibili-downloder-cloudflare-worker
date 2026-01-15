@@ -10,33 +10,44 @@ const headers = {
 };
 
 const API_URL = 'https://api.bilibili.com';
-const SliceSize = 1024 * 1024 * 40;
+const SliceSize = 1024 * 1024 * 5; // Reduced to 5MB to save CPU and Memory (GC pressure)
 
-export async function getMediaDataList(links: string[]): Promise<Promise<Record<number, ArrayBuffer>>[]> {
+export async function getMediaStream(links: string[]): Promise<ReadableStream> {
 	const sourceResponse = await fetch(links[0], {
 		headers: headers,
 	});
 
 	const sourceLength = Number(sourceResponse.headers.get('Content-Length')) || 0;
+	await sourceResponse.body?.cancel();
 	const sliceCount = Math.ceil(sourceLength / SliceSize);
-	const slices: Promise<Record<number, ArrayBuffer>>[] = Array(sliceCount)
-		.fill(0)
-		.map(async (_, index) => {
-			const start = index * SliceSize;
+
+	let currentSlice = 0;
+
+	return new ReadableStream({
+		async pull(controller) {
+			if (currentSlice >= sliceCount) {
+				controller.close();
+				return;
+			}
+
+			const start = currentSlice * SliceSize;
 			const end = Math.min(start + SliceSize - 1, sourceLength - 1);
 
 			try {
-				return getDashPart(links, {
+				const part = await getDashPart(links, {
 					start,
 					end,
-					index,
+					index: currentSlice,
 				});
+				const buffer = Object.values(part)[0];
+				controller.enqueue(new Uint8Array(buffer));
+				currentSlice++;
 			} catch (error) {
-				console.error(`Video Slice ${index + 1}/${sliceCount} Download Failed:\n`, error);
-				throw error;
+				console.error(`Video Slice ${currentSlice + 1}/${sliceCount} Download Failed:\n`, error);
+				controller.error(error);
 			}
-		});
-	return slices;
+		},
+	});
 }
 
 export async function getDashPart(
@@ -60,6 +71,7 @@ export async function getDashPart(
 				},
 			});
 			if (!response.ok) {
+				await response.body?.cancel();
 				throw new Error(`Error downloading slice ${data.index + 1}: ${response.status}`);
 			}
 			const buffer = await response.arrayBuffer();
@@ -80,24 +92,6 @@ export async function getDashPart(
 			}
 		}
 	}
-}
-
-export function processMediaDataList(mediaDataList: Record<number, ArrayBuffer>[]): ReadableStream {
-	const sortedDataList = mediaDataList.sort((a, b) => {
-		const aIndex = Object.keys(a)[0];
-		const bIndex = Object.keys(b)[0];
-		return Number(aIndex) - Number(bIndex);
-	});
-	const readStream = new ReadableStream({
-		start(controller) {
-			for (const data of sortedDataList) {
-				const buffer = Object.values(data)[0];
-				controller.enqueue(new Uint8Array(buffer));
-			}
-			controller.close();
-		},
-	});
-	return readStream;
 }
 
 export async function BiliBilifetch(url: string | URL, requestInit?: RequestInit): Promise<any> {

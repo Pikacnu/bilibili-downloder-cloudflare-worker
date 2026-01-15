@@ -12,7 +12,7 @@
  */
 
 import { setKvValue, getKvValue } from './kv';
-import { getIdType, getMediaDataList, getVideoInfo, getVideoPlayInfo, processMediaDataList } from './bilibili';
+import { getIdType, getMediaStream, getVideoInfo, getVideoPlayInfo } from './bilibili';
 
 export default {
 	async fetch(request, env, ctx): Promise<Response> {
@@ -47,8 +47,7 @@ export default {
 					return new Response('Not Found', { status: 404 });
 				}
 				console.time('Video Download');
-				const videoDataList = await getMediaDataList(videoLinks);
-				const readStream = processMediaDataList(await Promise.all(videoDataList));
+				const readStream = await getMediaStream(videoLinks);
 				console.timeEnd('Video Download');
 
 				return new Response(readStream, {
@@ -79,18 +78,19 @@ export default {
 			});
 		}
 
-		const url = header.get('x-url');
-		const urls = header.get('x-urls');
+		const url = header.get('x-url') || undefined;
+		const urls = header.get('x-bundled-urls') || undefined;
+		console.log(`Received Request: x-url=${url}, x-urls=${urls}`);
 		switch (true) {
-			case url !== undefined: {
+			case url !== undefined && url !== '': {
 				if (!url) {
-					return new Response('Bad Request', { status: 400 });
+					return Response.json({ error: 'Bad Request', message: 'URL header is empty' }, { status: 400 });
 				}
 				const method = header.get('x-method') || 'GET';
 				const body = header.get('x-body');
 				if (body) {
 					if (method === 'GET') {
-						return new Response('Bad Request', { status: 400 });
+						return Response.json({ error: 'Bad Request', message: 'GET method cannot have a body' }, { status: 400 });
 					}
 				}
 				const headers = new Headers(request.headers);
@@ -103,9 +103,10 @@ export default {
 				});
 				return response;
 			}
-			case urls !== undefined: {
+			case urls !== undefined && urls !== '': {
 				if (!urls) {
-					return new Response('Bad Request', { status: 400 });
+					console.error('URLs Header is Empty');
+					return Response.json({ error: 'Bad Request', message: 'URLs header is empty' }, { status: 400 });
 				}
 				const urlList = urls.split('|');
 				let ranges: Array<Array<[number, number]>>;
@@ -114,12 +115,13 @@ export default {
 					if (rangeHeader) {
 						ranges = JSON.parse(rangeHeader) as Array<Array<[number, number]>>;
 						if (ranges.length !== urlList.length) {
-							return new Response('Bad Request', { status: 400 });
+							console.error('Ranges Length Mismatch');
+							return Response.json({ error: 'Bad Request', message: 'Ranges length does not match URLs length' }, { status: 400 });
 						} else {
 							for (const rangeSet of ranges) {
 								for (const range of rangeSet) {
 									if (range[0] < 0 || range[1] < range[0]) {
-										return new Response('Bad Request', { status: 400 });
+										return Response.json({ error: 'Bad Request', message: 'Invalid range values' }, { status: 400 });
 									}
 								}
 							}
@@ -128,11 +130,12 @@ export default {
 						ranges = [];
 					}
 				} catch {
+					console.error('Failed to Parse Ranges Header');
 					console.error('Invalid Ranges Header');
 				}
 
 				const processedHeaders = new Headers(request.headers);
-				processedHeaders.delete('x-urls');
+				processedHeaders.delete('x-bundled-urls');
 				processedHeaders.delete('x-api-key');
 				processedHeaders.delete('x-ranges');
 
@@ -155,6 +158,7 @@ export default {
 							if (response.ok) {
 								return response;
 							}
+							await response.body?.cancel();
 							retry++;
 						}
 						throw new Error(`Failed to fetch ${targetUrl} after ${retryCount} retries`);
@@ -163,49 +167,35 @@ export default {
 				const responseBodyLengths: Array<number> = [];
 				const responseBodies: Array<Blob> = [];
 				const responses = await Promise.allSettled(fetchPromises);
-				const readResponsesPromises = responses.map((res) => {
-					if (res.status !== 'fulfilled') {
-						status.push(0);
-						responseBodyLengths.push(0);
-						responseBodies.push(new Blob());
-						return;
-					}
-					const response = res.value;
-					if (!response.ok) {
-						status.push(0);
-						responseBodyLengths.push(0);
-						responseBodies.push(new Blob());
-						return;
-					}
-					status.push(1);
-					const reader = response.body?.getReader();
-					const chunks: Uint8Array[] = [];
-					let receivedLength = 0;
-					if (!reader) {
-						responseBodyLengths.push(0);
-						responseBodies.push(new Blob());
-						return;
-					}
-					return reader.read().then(function processResult(result): Promise<void> | void {
-						if (result.done) {
-							const body = new Uint8Array(receivedLength);
-							let position = 0;
-							for (const chunk of chunks) {
-								body.set(chunk, position);
-								position += chunk.length;
-							}
-							responseBodyLengths.push(receivedLength);
-							responseBodies.push(new Blob(chunks));
-							return;
-						}
-						chunks.push(result.value);
-						receivedLength += result.value.length;
-						return reader.read().then(processResult);
-					});
-				});
-				await Promise.allSettled(readResponsesPromises);
 
-				const statusBuffer = new Uint8Array(status.length % 8 === 0 ? status.length / 8 : Math.floor(status.length / 8) + 1);
+				// Sequential processing to reduce peak CPU and Memory usage
+				for (const res of responses) {
+					if (res.status !== 'fulfilled' || !res.value.ok) {
+						status.push(0);
+						responseBodyLengths.push(0);
+						responseBodies.push(new Blob());
+						if (res.status === 'fulfilled') {
+							await res.value.body?.cancel();
+						}
+						continue;
+					}
+
+					const response = res.value;
+					status.push(1);
+					try {
+						const blob = await response.blob();
+						responseBodyLengths.push(blob.size);
+						responseBodies.push(blob);
+					} catch (e) {
+						console.error('Failed to read response body', e);
+						// Update status to 0 if reading failed
+						status[status.length - 1] = 0;
+						responseBodyLengths.push(0);
+						responseBodies.push(new Blob());
+					}
+				}
+
+				const statusBuffer = new Uint8Array(Math.ceil(status.length / 8));
 				status.forEach((s, i) => {
 					if (s === 1) {
 						statusBuffer[Math.floor(i / 8)] |= 1 << i % 8;
@@ -229,7 +219,7 @@ export default {
 				});
 			}
 			default:
-				return new Response('Bad Request', { status: 400 });
+				return Response.json({ error: 'Bad Request', message: 'No x-url or x-bundled-urls header provided' }, { status: 400 });
 		}
 	},
 } satisfies ExportedHandler<Env>;
